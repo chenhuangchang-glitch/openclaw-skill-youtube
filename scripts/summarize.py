@@ -94,7 +94,7 @@ def get_channel_videos(channel_id: str, hours: int, max_videos: int) -> List[Dic
         )
         
         if result.returncode != 0:
-            print(f"⚠️ yt-dlp error for {channel_id}: {result.stderr[:100]}", file=sys.stderr)
+            print(f"⚠️ yt-dlp error for {channel_id}: {(result.stderr or '')[:100]}", file=sys.stderr)  # pyre-fixme[16]: str slice
             return []
         
         data = json.loads(result.stdout)
@@ -152,6 +152,8 @@ def get_video_details(video_id: str) -> Optional[Dict]:
         duration = data.get("duration", 0)
         
         return {
+            "title": data.get("title", data.get("fulltitle", "Unknown")),
+            "channel": data.get("channel", data.get("uploader", "Unknown")),
             "duration_seconds": duration,
             "duration": f"{duration // 60}:{duration % 60:02d}",
             "description": data.get("description", "")[:1000],
@@ -197,18 +199,22 @@ def _parse_caption_xml(xml_text: str) -> List[str]:
             # Check for <s> child tags (format 3: word-level)
             words = []
             for s in p.findall('s'):
-                if s.text:
-                    words.append(html_mod.unescape(s.text.strip()))
+                s_text = s.text
+                if s_text is not None:
+                    words.append(html_mod.unescape(s_text.strip()))
             if words:
                 texts.append(' '.join(words))
-            elif p.text:  # format 2: direct text
-                texts.append(html_mod.unescape(p.text.strip()))
+            else:
+                p_text = p.text
+                if p_text is not None:  # format 2: direct text
+                    texts.append(html_mod.unescape(p_text.strip()))
         
         # If no <p> found, try <text> tags (format 1)
         if not texts:
             for elem in root.findall('.//text'):
-                if elem.text:
-                    texts.append(html_mod.unescape(elem.text.strip()))
+                elem_text = elem.text
+                if elem_text is not None:
+                    texts.append(html_mod.unescape(elem_text.strip()))
         
         return texts
     except Exception:
@@ -218,7 +224,7 @@ def _parse_caption_xml(xml_text: str) -> List[str]:
 def _download_caption(url: str) -> Optional[str]:
     """Download caption content, try proxy first then direct"""
     import urllib.parse
-    import requests
+    import requests  # pyre-fixme[21]: third-party runtime dependency
     
     # 1. Through Cloudflare proxy
     try:
@@ -243,7 +249,7 @@ def _download_caption(url: str) -> Optional[str]:
 def _get_transcript_innertube_proxy(video_id: str) -> Optional[str]:
     """Method 1: innertube ANDROID client + CF proxy to download captions"""
     try:
-        import innertube
+        import innertube  # pyre-fixme[21]: third-party runtime dependency
         
         client = innertube.InnerTube('ANDROID')
         data = client.player(video_id=video_id)
@@ -267,6 +273,9 @@ def _get_transcript_innertube_proxy(video_id: str) -> Optional[str]:
         if not cap_url:
             cap_url = caps[0]['baseUrl']
         
+        if not isinstance(cap_url, str):
+            return None
+        
         xml_text = _download_caption(cap_url)
         if not xml_text:
             return None
@@ -285,14 +294,18 @@ def _get_transcript_innertube_proxy(video_id: str) -> Optional[str]:
 def _get_transcript_ytapi(video_id: str) -> Optional[str]:
     """Method 2 (fallback): youtube-transcript-api direct connection"""
     try:
-        from youtube_transcript_api import YouTubeTranscriptApi
+        from youtube_transcript_api import YouTubeTranscriptApi  # pyre-fixme[21]: third-party runtime dependency
         
         api = YouTubeTranscriptApi()
-        fetched = api.fetch(video_id, languages=["zh-Hans", "zh-Hant", "en"])
-        transcript = " ".join([item["text"] for item in fetched])
+        transcript_list = api.list(video_id)
+        transcript_obj = transcript_list.find_transcript(["zh-Hans", "zh-Hant", "en", "zh-TW"])
+        fetched = transcript_obj.fetch()
+        transcript = " ".join([item["text"] if isinstance(item, dict) else getattr(item, "text", "") for item in fetched])
         return transcript if len(transcript) > 50 else None
         
     except Exception:
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -307,16 +320,21 @@ def generate_summary(title: str, channel: str, duration: str, transcript: str) -
         title=title,
         channel=channel,
         duration=duration,
-        transcript=transcript[:8000]  # Limit transcript length
+        transcript=transcript[:8000]  # pyre-fixme[16]: str slice; Limit transcript length
     )
     
     try:
-        import requests
+        import requests  # pyre-fixme[21]: third-party runtime dependency
+        
+        openai_key = os.environ.get("OPENAI_API_KEY")
+        if not openai_key:
+            print("⚠️ No OPENAI_API_KEY environment variable found", file=sys.stderr)
+            return None
         
         response = requests.post(
-            "http://localhost:3000/v1/chat/completions",
+            "https://api.openai.com/v1/chat/completions",
             headers={
-                "Authorization": f"Bearer {token}",
+                "Authorization": f"Bearer {openai_key}",
                 "Content-Type": "application/json"
             },
             json={
@@ -339,7 +357,7 @@ def generate_summary(title: str, channel: str, duration: str, transcript: str) -
         return None
 
 
-def process_video(video_id: str, title: str = None, channel: str = None) -> Dict:
+def process_video(video_id: str, title: Optional[str] = None, channel: Optional[str] = None) -> Dict:
     """Process a single video: get details, transcript, and summary"""
     print(f"📹 Processing: {video_id}")
     
@@ -359,9 +377,9 @@ def process_video(video_id: str, title: str = None, channel: str = None) -> Dict
     
     result = {
         "video_id": video_id,
-        "title": title or "Unknown",
+        "title": title or details.get("title", "Unknown"),
         "url": f"https://www.youtube.com/watch?v={video_id}",
-        "channel": channel or "Unknown",
+        "channel": channel or details.get("channel", "Unknown"),
         "duration": details["duration"],
         "published": details["published"],
         "has_transcript": has_transcript,
@@ -372,17 +390,19 @@ def process_video(video_id: str, title: str = None, channel: str = None) -> Dict
     }
     
     # Generate summary if transcript available
-    if has_transcript:
+    video_title = title or details.get("title", "Unknown")
+    video_channel = channel or details.get("channel", "Unknown")
+    if has_transcript and transcript is not None:
         print(f"  ✅ Transcript: {len(transcript)} chars")
-        summary = generate_summary(title, channel, details["duration"], transcript)
+        summary = generate_summary(video_title, video_channel, details["duration"], transcript)
         if summary:
             result["summary"] = summary
             print(f"  ✅ Summary: {len(summary)} chars")
         else:
-            result["summary"] = f"⚠️ 摘要生成失败\n\n视频有字幕但 LLM 调用失败。"
+            result["summary"] = "⚠️ 摘要生成失败\n\n视频有字幕但 LLM 调用失败。"
     else:
-        result["summary"] = f"📺 **需观看获取详细内容**\n\n视频暂无字幕，无法生成详细摘要。\n\n基于标题推测：{title}"
-        print(f"  ⚠️ No transcript available")
+        result["summary"] = f"📺 **需观看获取详细内容**\n\n视频暂无字幕，无法生成详细摘要。\n\n基于标题推测：{video_title}"
+        print("  ⚠️ No transcript available")
     
     return result
 
@@ -398,26 +418,31 @@ def main():
     
     args = parser.parse_args()
     
-    results = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "items": [],
-        "stats": {
-            "total_videos": 0,
-            "with_transcript": 0,
-            "without_transcript": 0
-        }
+    items: List[Dict] = []
+    stats: Dict[str, int] = {
+        "total_videos": 0,
+        "with_transcript": 0,
+        "without_transcript": 0
     }
+    results: Dict[str, object] = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "items": items,
+        "stats": stats
+    }
+    
+    def _record_result(result: Dict) -> None:
+        """Append a processed video result and update stats."""
+        items.append(result)
+        stats["total_videos"] += 1
+        if result.get("has_transcript"):
+            stats["with_transcript"] += 1
+        else:
+            stats["without_transcript"] += 1
     
     # Mode 1: Single video
     if args.url:
         video_id = args.url.split("v=")[-1].split("&")[0]
-        result = process_video(video_id)
-        results["items"].append(result)
-        results["stats"]["total_videos"] = 1
-        if result.get("has_transcript"):
-            results["stats"]["with_transcript"] = 1
-        else:
-            results["stats"]["without_transcript"] = 1
+        _record_result(process_video(video_id))
     
     # Mode 2: Channel scan
     elif args.channel:
@@ -425,13 +450,7 @@ def main():
         print(f"📺 Found {len(videos)} videos from channel")
         
         for video in videos:
-            result = process_video(video["id"], video["title"], video["channel"])
-            results["items"].append(result)
-            results["stats"]["total_videos"] += 1
-            if result.get("has_transcript"):
-                results["stats"]["with_transcript"] += 1
-            else:
-                results["stats"]["without_transcript"] += 1
+            _record_result(process_video(video["id"], video["title"], video["channel"]))
     
     # Mode 3: Daily batch (config file)
     elif args.daily and args.config:
@@ -453,13 +472,7 @@ def main():
             print(f"  Found {len(videos)} videos")
             
             for video in videos:
-                result = process_video(video["id"], video["title"], channel_name)
-                results["items"].append(result)
-                results["stats"]["total_videos"] += 1
-                if result.get("has_transcript"):
-                    results["stats"]["with_transcript"] += 1
-                else:
-                    results["stats"]["without_transcript"] += 1
+                _record_result(process_video(video["id"], video["title"], channel_name))
     
     else:
         parser.print_help()
@@ -473,7 +486,7 @@ def main():
         json.dump(results, f, indent=2, ensure_ascii=False)
     
     print(f"\n✅ Output written to: {output_path}")
-    print(f"📊 Stats: {results['stats']}")
+    print(f"📊 Stats: {stats}")
 
 
 if __name__ == "__main__":
